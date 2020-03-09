@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import jsn
 import re
 import math
 import subprocess
@@ -8,10 +9,11 @@ import platform
 
 
 # paths and info for current build environment
-class build_info:
+class BuildInfo:
     shader_platform = ""                                                # hlsl, glsl, metal, spir-v, pssl
     shader_sub_platform = ""                                            # gles
-    shader_version = ""                                                 # 4_0, 5_0 (hlsl), 330, 420 (glsl), 1.1, 2.0 (metal)
+    shader_version = "0"                                                # 4_0, 5_0 (hlsl), 330, 420 (glsl), 1.1, 2.0 (metal)
+    user_shader_version = "0"                                           # ^^ pmfx might force shader version
     metal_sdk = ""                                                      # macosx, iphoneos, appletvos
     metal_min_os = ""                                                   # iOS (9.0 - 13.0), macOS (10.11 - 10.15)
     debug = False                                                       # generate shader with debug info
@@ -31,7 +33,7 @@ class build_info:
 
 
 # info and contents of a .pmfx file
-class pmfx_info:
+class PmfxInfo:
     includes = ""                                                       # list of included files
     json = ""                                                           # json object containing techniques
     json_text = ""                                                      # json as text to reload mutable dictionary
@@ -39,7 +41,7 @@ class pmfx_info:
 
 
 # info of pmfx technique permutation which is a combination of vs, ps or cs
-class technique_permutation_info:
+class TechniquePermutationInfo:
     technique_name = ""                                                 # name of technique
     technique = ""                                                      # technique / permutation json
     permutation = ""                                                    # permutation options
@@ -54,7 +56,7 @@ class technique_permutation_info:
 
 
 # info about a single vs, ps, or cs
-class single_shader_info:
+class SingleShaderInfo:
     shader_type = ""                                                    # ie. vs (vertex), ps (pixel), cs (compute)
     main_func_name = ""                                                 # entry point ie. vs_main
     functions_source = ""                                               # source code of all used functions
@@ -92,6 +94,7 @@ def parse_args():
             _info.shader_platform = sys.argv[i + 1]
         if "-shader_version" in sys.argv[i]:
             _info.shader_version = sys.argv[i + 1]
+            _info.user_shader_version = sys.argv[i + 1]
         if sys.argv[i] == "-i":
             j = i + 1
             while j < len(sys.argv) and sys.argv[j][0] != '-':
@@ -656,11 +659,14 @@ def generate_technique_constant_buffers(pmfx_json, _tp):
     cb_str += "};\n"
 
     # append permutation string to shader c struct
-    skips = [_info.shader_platform.upper(), _info.shader_sub_platform.upper()]
+    skips = [
+        _info.shader_platform.upper(),
+        _info.shader_sub_platform.upper()
+    ]
     permutation_name = ""
     if int(_tp.id) != 0:
         for p in _tp.permutation:
-            if p[0] in skips:
+            if p[0] in skips or p[0] in caps_list():
                 continue
             if p[1] == 1:
                 permutation_name += "_" + p[0].lower()
@@ -820,6 +826,62 @@ def generate_permutation_id(define_list, permutation):
     return pid
 
 
+# return shader version as float for consistent comparisons, version will be a string
+def shader_version_float(platform, version):
+    if platform == "metal":
+        # metal version is already a float
+        return float(version)
+    elif platform == "glsl" or platform == "spiv":
+        # glsl version is integer 330, 400, 450..
+        return float(version)
+    elif platform == "hlsl":
+        # hlsl version is 3_0, 5_0
+        return float(version.replace("_", "."))
+
+
+# just list of all the caps
+def caps_list():
+    return [
+        "PMFX_TEXTURE_CUBE_ARRAY",
+        "PMFX_COMPUTE_SHADER"
+    ]
+
+
+# based on shader platform and version, some features may or may not be available
+def defines_from_caps(define_list):
+    global _info
+    # platform, feature version
+    lookup = {
+        "metal": [
+            ["PMFX_TEXTURE_CUBE_ARRAY", 0.0],
+            ["PMFX_COMPUTE_SHADER", 0.0]
+        ],
+        "glsl": [
+            ["PMFX_TEXTURE_CUBE_ARRAY", 400.0],
+            ["PMFX_COMPUTE_SHADER", 450.0]
+        ],
+        "spirv": [
+            ["PMFX_TEXTURE_CUBE_ARRAY", 400.0],
+            ["PMFX_COMPUTE_SHADER", 450.0]
+        ],
+        "hlsl": [
+            ["PMFX_TEXTURE_CUBE_ARRAY", 4.0],
+            ["PMFX_COMPUTE_SHADER", 5.0]
+        ]
+    }
+    # check platform exists
+    platform = _info.shader_platform
+    if platform not in lookup.keys():
+        return []
+    # add features
+    version = shader_version_float(platform, _info.shader_version)
+    define_list = []
+    for cap in lookup[_info.shader_platform]:
+        if version >= cap[1]:
+            define_list.append((cap[0], [1], -1))
+    return define_list
+
+
 # generate permutation list from technique json
 def generate_permutations(technique, technique_json):
     global _info
@@ -830,6 +892,7 @@ def generate_permutations(technique, technique_json):
     define_string = ""
     define_list.append((_info.shader_platform.upper(), [1], -1))
     define_list.append((_info.shader_sub_platform.upper(), [1], -1))
+    define_list = defines_from_caps(define_list)
     if "permutations" in technique_json:
         for p in technique_json["permutations"].keys():
             pp = technique_json["permutations"][p]
@@ -879,7 +942,7 @@ def find_pmfx_json(shader_file_text):
         # pmfx json exists, return the block
         json_loc = shader_file_text.find("{", pmfx_loc)
         pmfx_end = enclose_brackets(shader_file_text[pmfx_loc:])
-        pmfx_json = json.loads(shader_file_text[json_loc:pmfx_end + json_loc])
+        pmfx_json = jsn.loads(shader_file_text[json_loc:pmfx_end + json_loc])
         return pmfx_json
     else:
         # shader can have no pmfx, provided it supplies vs_main and ps_main
@@ -997,7 +1060,7 @@ def find_used_functions(entry_func, function_list):
 
 # generate a vs, ps or cs from _tp (technique permutation data)
 def generate_single_shader(main_func, _tp):
-    _si = single_shader_info()
+    _si = SingleShaderInfo()
     _si.main_func_name = main_func
 
     # find main func
@@ -1182,7 +1245,7 @@ def compile_hlsl(_info, pmfx_name, _tp, _shader):
     exe = os.path.join(_info.tools_dir, "bin", "fxc", "fxc")
 
     # default sm 4
-    if _info.shader_version == "":
+    if _info.shader_version == "0":
         _info.shader_version = "4_0"
 
     sm = str(_info.shader_version)
@@ -1329,12 +1392,13 @@ def compile_glsl(_info, pmfx_name, _tp, _shader):
     instance_inputs, instance_input_semantics = parse_io_struct(_shader.instance_input_decl)
 
     # default 330
-    if _info.shader_version == "":
+    if _info.shader_version == "0":
         _info.shader_version = "330"
 
     # binding points for samples and uniform buffers are only supported 420 onwards..
     # you may have luck trying the extension.
     binding_points = int(_info.shader_version) >= 420
+    texture_cube_array = int(_info.shader_version) >= 400
 
     uniform_buffers = ""
     for cbuf in _shader.cbuffers:
@@ -1368,7 +1432,13 @@ def compile_glsl(_info, pmfx_name, _tp, _shader):
         shader_source += "#define GLSL\n"
         if binding_points:
             shader_source += "#define BINDING_POINTS\n"
-    shader_source += "#define TEXTURE_OFFSET " + str(_info.texture_offset) + "\n"
+        if texture_cube_array:
+            shader_source += "#define PMFX_TEXTURE_CUBE_ARRAY\n"
+    # texture offset is to avoid collisions on descriptor set slots in vulkan
+    if _info.shader_sub_platform == "spirv":
+        shader_source += "#define TEXTURE_OFFSET " + str(_info.texture_offset) + "\n"
+    else:
+        shader_source += "#define TEXTURE_OFFSET 0\n"
     shader_source += "//" + pmfx_name + " " + _tp.name + " " + _shader.shader_type + " " + str(_tp.id) + "\n"
     shader_source += _info.macros_source
 
@@ -1992,7 +2062,7 @@ def compile_metal(_info, pmfx_name, _tp, _shader):
 
         # default to metal 2.0, but allow cmdline override
         metal_version = "2.0"
-        if _info.shader_version != "":
+        if _info.shader_version != "0":
             metal_version = _info.shader_version
 
         # selection of sdk, macos, ios, tvos
@@ -2080,6 +2150,7 @@ def generate_input_info(inputs):
         ["NORMAL", "4"],
         ["TANGENT", "4"],
         ["BITANGENT", "4"],
+        ["BLENDWEIGHTS", "4"],
         ["COLOR", "1"],
         ["BLENDINDICES", "1"]
     ]
@@ -2192,7 +2263,7 @@ def parse_pmfx(file, root):
     global _info
 
     # new pmfx info
-    _pmfx = pmfx_info()
+    _pmfx = PmfxInfo()
 
     file_and_path = os.path.join(root, file)
     shader_file_text, included_files = create_shader_set(file_and_path, root)
@@ -2236,7 +2307,6 @@ def parse_pmfx(file, root):
 
     # for techniques in pmfx
     success = True
-    default_shader_version = _info.shader_version
     for technique in _pmfx.json:
         pmfx_json = json.loads(_pmfx.json_text)
         technique_json = pmfx_json[technique].copy()
@@ -2247,7 +2317,7 @@ def parse_pmfx(file, root):
         # for permutations in technique
         for permutation in technique_permutations:
             pmfx_json = json.loads(_pmfx.json_text)
-            _tp = technique_permutation_info()
+            _tp = TechniquePermutationInfo()
             _tp.shader = []
             _tp.cbuffers = []
 
@@ -2260,7 +2330,7 @@ def parse_pmfx(file, root):
             _tp.permutation_options = permutation_options
 
             valid = True
-            _info.shader_version = default_shader_version
+            _info.shader_version = _info.user_shader_version
             if "supported_platforms" in _tp.technique:
                 sp = _tp.technique["supported_platforms"]
                 if _info.shader_platform not in sp:
@@ -2388,14 +2458,14 @@ def parse_pmfx(file, root):
             h_file.close()
 
 
-# entry
-if __name__ == "__main__":
+# main function to avoid shadowing
+def main():
     print("--------------------------------------------------------------------------------")
     print("pmfx shader (v3) ---------------------------------------------------------------")
     print("--------------------------------------------------------------------------------")
 
     global _info
-    _info = build_info()
+    _info = BuildInfo()
     _info.error_code = 0
 
     parse_args()
@@ -2404,6 +2474,7 @@ if __name__ == "__main__":
         _info.shader_platform = "glsl"
         _info.shader_version = "450"
         _info.shader_sub_platform = "spirv"
+        _info.user_shader_version = _info.shader_version
 
     if _info.shader_platform == "gles":
         _info.shader_platform = "glsl"
@@ -2441,3 +2512,8 @@ if __name__ == "__main__":
 
     # error code for ci
     sys.exit(_info.error_code)
+
+
+# entry
+if __name__ == "__main__":
+    main()
